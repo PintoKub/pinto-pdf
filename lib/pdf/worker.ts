@@ -330,74 +330,121 @@ async function organize(file: File, pages: PageRef[], report: Progress): Promise
 // environment to tune further; PLAN.md §6 has the reviewer doing that
 // against a real "messy" PDF at Gate 1. Treat these three numbers as a
 // starting guess, not a final answer.
-const COMPRESS_TIERS: Record<CompressTier, { scale: number; quality: number }> = {
-  // `scale` multiplies the PDF's native 72 DPI, so scale 1.0 rasterizes a page
-  // at 72 DPI — far too coarse to read body text, which is what the first pass
-  // shipped. 2.0 = 144 DPI is comfortably readable; 1.4 = ~101 DPI is the floor
-  // where 10pt text still holds together. Quality carries the rest of the
-  // saving, because JPEG artifacts cost less legibility than missing pixels do.
-  // ponytail: tuned by eye against real scans, not measured. If someone
-  // complains a specific tier is still too soft, move scale before quality.
-  low: { scale: 2.0, quality: 0.82 },
-  recommended: { scale: 1.7, quality: 0.72 },
-  strong: { scale: 1.4, quality: 0.6 },
+const COMPRESS_TIERS: Record<CompressTier, Array<{ scale: number; quality: number }>> = {
+  // `scale` multiplies the PDF's native 72 DPI, so scale 1.0 rasterizes at 72 DPI
+  // — too coarse to read body text. 2.0 = 144 DPI is comfortably readable.
+  //
+  // Each tier is a LADDER, not one setting. A single fixed scale only works when
+  // the source has resolution to spare: hand it a scan that's already near the
+  // target DPI and the re-encode comes out bigger than the original, so nothing
+  // happens at all. When a step fails to shrink the file we drop to the next one
+  // rather than giving up. The last step in each ladder is the legibility floor
+  // for that tier — below it, text stops being readable and a smaller file isn't
+  // worth having.
+  // ponytail: retries re-render the whole document, so a file that only shrinks
+  // on step 3 costs 3x the work. Fine because step 1 succeeds for almost
+  // everything; revisit by measuring embedded image DPI up front if it bites.
+  low: [
+    { scale: 2.0, quality: 0.82 },
+    { scale: 1.5, quality: 0.72 },
+    { scale: 1.15, quality: 0.65 },
+  ],
+  recommended: [
+    { scale: 1.7, quality: 0.72 },
+    { scale: 1.25, quality: 0.62 },
+    { scale: 1.0, quality: 0.55 },
+  ],
+  strong: [
+    { scale: 1.4, quality: 0.6 },
+    { scale: 1.05, quality: 0.5 },
+    { scale: 0.85, quality: 0.45 },
+  ],
 };
+
+async function renderPass(
+  doc: PDFDocumentProxy,
+  scale: number,
+  quality: number,
+  filename: string,
+  report: Progress,
+): Promise<Uint8Array> {
+  const outDoc = await PdfLibDocument.create();
+  const total = doc.numPages;
+  report(0, total);
+  for (let i = 1; i <= total; i++) {
+    const page = await doc.getPage(i);
+    try {
+      // Physical page size in points, rotation already applied by pdf.js
+      // (getViewport defaults `rotation` to the page's own /Rotate).
+      const sizeViewport = page.getViewport({ scale: 1 });
+      const rasterViewport = page.getViewport({ scale });
+      const width = Math.max(1, Math.ceil(rasterViewport.width));
+      const height = Math.max(1, Math.ceil(rasterViewport.height));
+      assertRasterSizeOk(width, height, filename);
+
+      const canvas = new OffscreenCanvas(width, height);
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new PdfError('corrupt', 'Canvas 2D context unavailable.', filename);
+      // pdf.js duck-types on `canvas.getContext(...)`; OffscreenCanvas works at
+      // runtime even though the public .d.ts still only spells out
+      // HTMLCanvasElement (pdf.js itself uses OffscreenCanvas internally — see
+      // `isOffscreenCanvasSupported` in pdf.mjs).
+      await page.render({ canvas: canvas as unknown as HTMLCanvasElement, viewport: rasterViewport }).promise;
+
+      const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality });
+      const jpegBytes = new Uint8Array(await blob.arrayBuffer());
+      const image = await outDoc.embedJpg(jpegBytes);
+      const outPage = outDoc.addPage([sizeViewport.width, sizeViewport.height]);
+      outPage.drawImage(image, { x: 0, y: 0, width: sizeViewport.width, height: sizeViewport.height });
+    } finally {
+      page.cleanup();
+    }
+    report(i, total);
+  }
+  return new Uint8Array(await outDoc.save());
+}
 
 async function compress(file: File, tier: CompressTier, report: Progress): Promise<PdfResult> {
   const originalBytes = await readBytes(file);
   assertNotEmpty(originalBytes, file.name);
-  const { scale, quality } = COMPRESS_TIERS[tier];
   const { doc, loadingTask } = await loadPdfJsDoc(originalBytes, file.name);
   try {
-    const outDoc = await PdfLibDocument.create();
-    const total = doc.numPages;
-    report(0, total);
-    for (let i = 1; i <= total; i++) {
-      const page = await doc.getPage(i);
-      try {
-        // Physical page size in points, rotation already applied by pdf.js
-        // (getViewport defaults `rotation` to the page's own /Rotate).
-        const sizeViewport = page.getViewport({ scale: 1 });
-        const rasterViewport = page.getViewport({ scale });
-        const width = Math.max(1, Math.ceil(rasterViewport.width));
-        const height = Math.max(1, Math.ceil(rasterViewport.height));
-        assertRasterSizeOk(width, height, file.name);
-
-        const canvas = new OffscreenCanvas(width, height);
-        const ctx = canvas.getContext('2d');
-        if (!ctx) throw new PdfError('corrupt', 'Canvas 2D context unavailable.', file.name);
-        // pdf.js duck-types on `canvas.getContext(...)`; OffscreenCanvas
-        // works at runtime even though the public .d.ts still only spells
-        // out HTMLCanvasElement (pdf.js itself uses OffscreenCanvas
-        // internally — see `isOffscreenCanvasSupported` in pdf.mjs).
-        await page.render({ canvas: canvas as unknown as HTMLCanvasElement, viewport: rasterViewport }).promise;
-
-        const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality });
-        const jpegBytes = new Uint8Array(await blob.arrayBuffer());
-        const image = await outDoc.embedJpg(jpegBytes);
-        const outPage = outDoc.addPage([sizeViewport.width, sizeViewport.height]);
-        outPage.drawImage(image, {
-          x: 0,
-          y: 0,
-          width: sizeViewport.width,
-          height: sizeViewport.height,
-        });
-      } finally {
-        page.cleanup();
+    const ladder = COMPRESS_TIERS[tier];
+    for (let step = 0; step < ladder.length; step++) {
+      const { scale, quality } = ladder[step];
+      const bytes = await renderPass(doc, scale, quality, file.name, report);
+      if (bytes.byteLength < originalBytes.byteLength) {
+        if (step > 0) {
+          console.debug(
+            `[pdf/compress] "${file.name}": tier "${tier}" needed ladder step ${step + 1}/${ladder.length} (scale ${scale}, q ${quality}).`,
+          );
+        }
+        return { bytes, filename: withSuffix(file.name, 'compressed') };
       }
-      report(i, total);
-    }
-
-    const compressedBytes = await outDoc.save();
-    if (compressedBytes.byteLength >= originalBytes.byteLength) {
-      // Rasterizing made it worse — common on small, already-efficient,
-      // mostly-text PDFs. Never hand back a file bigger than the input.
-      console.warn(
-        `[pdf/compress] "${file.name}": compressed (${compressedBytes.byteLength}B) >= original (${originalBytes.byteLength}B); returning the original untouched.`,
+      console.debug(
+        `[pdf/compress] "${file.name}": tier "${tier}" step ${step + 1}/${ladder.length} (scale ${scale}, q ${quality}) produced ${bytes.byteLength}B >= ${originalBytes.byteLength}B; stepping down.`,
       );
-      return { bytes: originalBytes, filename: file.name };
+      // Each ladder step lands at roughly 0.6x the previous one, so from more
+      // than 4x the original no remaining step can get under it — walking the
+      // rest just burns a full re-render per step. A text PDF measures ~340x
+      // here, so this is the difference between one wasted render and three on
+      // the most common "this can't be compressed" file.
+      // ponytail: 4x is a measured heuristic, not a proof. If a real file ever
+      // gets wrongly refused, raise it or compute the bound from the actual
+      // step ratios.
+      if (bytes.byteLength > originalBytes.byteLength * 4) {
+        console.debug(
+          `[pdf/compress] "${file.name}": ${(bytes.byteLength / originalBytes.byteLength).toFixed(1)}x the original — no lower step can win; abandoning the ladder.`,
+        );
+        break;
+      }
     }
-    return { bytes: compressedBytes, filename: withSuffix(file.name, 'compressed') };
+    // Every step in the ladder came out bigger than the input. That's the
+    // correct outcome for a document that is already efficient — a text PDF
+    // stores glyph references, and no raster of a page beats that. Hand back
+    // the original untouched; the caller compares sizes and tells the user the
+    // file can't be reduced, rather than offering a pointless download.
+    return { bytes: originalBytes, filename: file.name };
   } finally {
     await loadingTask.destroy();
   }

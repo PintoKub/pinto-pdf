@@ -49,7 +49,19 @@ export type ToolShellProps = {
   /** Rendered between the file list and the run button. */
   options?: (files: File[]) => ReactNode;
   run: (files: File[], onProgress: Progress) => Promise<PdfResult>;
+  /**
+   * Shown instead of a download link when the output is no smaller than the
+   * input. Only compress passes this: for the other tools "output >= input" is
+   * a normal outcome (merging two files makes a bigger one) and says nothing.
+   */
+  noReductionMessage?: string;
 };
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 export default function ToolShell({
   title,
@@ -60,6 +72,7 @@ export default function ToolShell({
   cta,
   options,
   run,
+  noReductionMessage,
 }: ToolShellProps) {
   const [files, setFiles] = useState<File[]>([]);
   const [dragging, setDragging] = useState(false);
@@ -69,7 +82,7 @@ export default function ToolShell({
   // reader gets occasional progress instead of a flood of near-identical reads.
   const [announced, setAnnounced] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<{ url: string; filename: string } | null>(null);
+  const [result, setResult] = useState<{ url: string; filename: string; inputBytes: number; outputBytes: number } | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   // The object URL is the only thing here that leaks if we forget it.
@@ -125,7 +138,8 @@ export default function ToolShell({
       // and avoids copying a large PDF just to satisfy BlobPart.
       const bytes = output.bytes as Uint8Array<ArrayBuffer>;
       const url = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
-      setResult({ url, filename: output.filename });
+      const inputBytes = files.reduce((sum, file) => sum + file.size, 0);
+      setResult({ url, filename: output.filename, inputBytes, outputBytes: bytes.byteLength });
       setAnnounced("Done. Your PDF is ready.");
     } catch (thrown) {
       setError(describe(thrown));
@@ -285,21 +299,30 @@ export default function ToolShell({
         </p>
       )}
 
-      {result && (
-        <div className="border-hairline mt-8 rounded-[18px] border p-6">
-          <p className="text-[17px] font-semibold">Your PDF is ready.</p>
-          <p className="text-soft mt-1 text-[13px]">
-            It was built here, on this device.
-          </p>
-          <a
-            href={result.url}
-            download={result.filename}
-            className="bg-accent hover:bg-accent-hover mt-5 inline-block rounded-full px-6 py-3 text-[17px] font-medium text-white transition-colors"
-          >
-            Download {result.filename}
-          </a>
-        </div>
-      )}
+      {result &&
+        (noReductionMessage && result.outputBytes >= result.inputBytes ? (
+          <div className="border-hairline mt-8 rounded-[18px] border p-6">
+            <p className="text-[17px] font-semibold">This file is already as small as it gets.</p>
+            <p className="text-soft mt-1 text-[13px]">{noReductionMessage}</p>
+          </div>
+        ) : (
+          <div className="border-hairline mt-8 rounded-[18px] border p-6">
+            <p className="text-[17px] font-semibold">Your PDF is ready.</p>
+            <p className="text-soft mt-1 text-[13px]">
+              {formatBytes(result.inputBytes)} → {formatBytes(result.outputBytes)}
+              {result.outputBytes < result.inputBytes &&
+                ` — ${Math.round((1 - result.outputBytes / result.inputBytes) * 100)}% smaller`}
+              . Built here, on this device.
+            </p>
+            <a
+              href={result.url}
+              download={result.filename}
+              className="bg-accent hover:bg-accent-hover mt-5 inline-block rounded-full px-6 py-3 text-[17px] font-medium text-white transition-colors"
+            >
+              Download {result.filename}
+            </a>
+          </div>
+        ))}
     </div>
   );
 }

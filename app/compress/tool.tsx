@@ -60,6 +60,7 @@ export default function CompressTool() {
       accept="application/pdf"
       noun="a PDF"
       cta="Reduce size"
+      noReductionMessage="Every setting we tried came out bigger than the original, so we left it alone. PDFs that are mostly text are already about as compact as they get — redrawing the pages as images would only add bytes."
       options={(files) => (
         <>
           <Segmented label="How much" value={tier} onChange={setTier} options={tiers} />
