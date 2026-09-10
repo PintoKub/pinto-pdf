@@ -328,13 +328,12 @@ async function organize(file: File, pages: PageRef[], report: Progress): Promise
 // compress
 // ---------------------------------------------------------------------------
 
-// Starting point from PLAN.md §3, validated so far only against the
-// synthetic raster-heavy fixture in app/selftest (a large noise image
-// embedded well above its display size — see selftest for why that's a
-// meaningful stand-in). No real-world PDF corpus was available in this
-// environment to tune further; PLAN.md §6 has the reviewer doing that
-// against a real "messy" PDF at Gate 1. Treat these three numbers as a
-// starting guess, not a final answer.
+// Tuned against the five synthetic fixtures in app/selftest, whose measured
+// output is printed there as a calibration table. They are still synthetic:
+// no real-world PDF corpus was available to tune against, and legibility in
+// particular cannot be asserted by a test — only looked at. If a real scan
+// comes out unreadable, the last step of that tier's ladder is the floor to
+// raise.
 const COMPRESS_TIERS: Record<CompressTier, Array<{ scale: number; quality: number }>> = {
   // `scale` multiplies the PDF's native 72 DPI, so scale 1.0 rasterizes at 72 DPI
   // — too coarse to read body text. 2.0 = 144 DPI is comfortably readable.

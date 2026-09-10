@@ -68,23 +68,56 @@ Then open http://localhost:3000. `/selftest` runs the real engine against genera
 fixtures and prints the compression calibration table — it is the fastest way to check a
 build is healthy.
 
-## Self-host
+## Deploy
 
-`next build` produces `out/`, about 4MB of static files. Any file server will do.
-
-```bash
-docker build -t pinto-pdf .
-docker run -d -p 8080:80 pinto-pdf
-```
+`next build` produces `out/` — about 4MB of plain files, no Node process at runtime.
+That is the whole deploy artifact, which is why every option below is cheap: there is no
+server to run, only files to hand out.
 
 **One host requirement that is easy to miss:** `.mjs` must be served as JavaScript.
 pdf.js's worker is an `.mjs` module and nginx's stock `mime.types` has no entry for it,
 so it goes out as `application/octet-stream` and the browser refuses the import. Only
-compression breaks — the other three tools keep working — so it looks like an engine bug
-rather than a server config bug. The `Dockerfile` patches this. Vercel and Cloudflare
-Pages already get it right.
+compression breaks — the other three tools keep working — so it reads as an engine bug
+rather than a server config bug. Vercel and Cloudflare Pages already get this right; the
+`Dockerfile` patches it for the self-hosted path.
 
-See [PLAN.md](PLAN.md) for the deploy options and the design rationale.
+### Cloudflare Pages or Vercel
+
+Connect the repo. Build command `npm run build`, output directory `out`. No environment
+variables, no build overrides, no functions. Every push to `main` redeploys.
+
+### Self-hosted
+
+```bash
+docker build -t pinto-pdf .
+docker run -d --restart unless-stopped -p 8080:80 --name pinto pinto-pdf
+```
+
+To expose it from a home machine, use a **Cloudflare Tunnel rather than port
+forwarding**:
+
+```bash
+cloudflared tunnel create pinto
+cloudflared tunnel route dns pinto pdf.example.com
+cloudflared tunnel run --url http://localhost:8080 pinto
+```
+
+The tunnel dials *out* to Cloudflare, so no inbound ports open on the router, the home
+IP never appears in public DNS, TLS terminates at Cloudflare, and a dynamic IP stops
+mattering. Port forwarding gives up all four. `cloudflared service install` makes it
+survive a reboot.
+
+Worth being clear that self-hosting a static public site adds a machine that has to stay
+up and gains nothing a CDN wasn't already doing for free. Do it to own the metal, not
+for the site's sake.
+
+### After deploying
+
+Open `/selftest` on the live URL and confirm 9/9. It runs the real engine, so it tests
+the deployed bundle rather than a status page — this is what caught the `.mjs` problem
+above. Then put a real scanned PDF through `/compress` and a phone photo through
+`/photo-to-pdf`: EXIF rotation and compression legibility are the two things synthetic
+fixtures cannot prove.
 
 ## Built with
 

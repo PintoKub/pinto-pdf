@@ -13,8 +13,8 @@ This block is written and re-added by `next dev` — verify at `node_modules/nex
 # Pinto PDF — project rules
 
 All-in-one PDF tool site. Four tools: **Merge**, **Reduce size**, **Organize pages**,
-**Photo → PDF**. `README.md` is the overview; `PLAN.md` has the design rationale and the
-deploy options. Read both before writing code.
+**Photo → PDF**. `README.md` is the overview, the design rationale and the deploy
+options. Read it before writing code.
 
 ## The one architectural rule
 
@@ -38,6 +38,21 @@ anywhere is not a refactor — it removes the only reason to use this over iLove
   means changing both sides — do that deliberately, not incidentally.
 - **No speculative abstraction.** No interface with one implementation, no factory, no
   `utils.ts` dumping ground, no config object for a value that never changes.
+
+## The contract
+
+`lib/pdf/types.ts` is the seam between the UI and the engine, and it is the file to read
+first. Two decisions in it shape everything else:
+
+**`organize` takes the full desired page list**, so reorder, delete and rotate are one
+function instead of three. Fewer functions, fewer states, one undo model in the UI.
+
+**Rotation is absolute, not relative.** A page carries the rotation it should end up
+with, so nothing has to track how many times a button was pressed.
+
+The engine runs in a Web Worker over raw `postMessage` with a request-id map — no
+Comlink. Structured clone strips `Error` subclasses, so `PdfError` is rehydrated on the
+main thread from `{code, message, filename}`. That is easy to reintroduce as a bug.
 
 ## Before you say you're done
 
