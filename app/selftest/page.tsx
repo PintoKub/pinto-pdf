@@ -169,6 +169,23 @@ async function testCompressTier(tier: CompressTier): Promise<void> {
   );
 }
 
+// The tiers are hand-tuned numbers, so the thing worth guarding isn't any one
+// value — it's that they stay ordered. A tier edit that makes "strong" bigger
+// than "light" means the picker is lying to the user about what they chose.
+async function testTierOrdering(): Promise<void> {
+  const file = await makeRasterHeavyPdf();
+  const [light, recommended, strong] = await Promise.all([
+    compress(file, 'low'),
+    compress(file, 'recommended'),
+    compress(file, 'strong'),
+  ]);
+  assertTrue(
+    strong.bytes.byteLength < recommended.bytes.byteLength &&
+      recommended.bytes.byteLength < light.bytes.byteLength,
+    `expected strong < recommended < light, got ${strong.bytes.byteLength} / ${recommended.bytes.byteLength} / ${light.bytes.byteLength}`,
+  );
+}
+
 async function testCorruptRejects(): Promise<void> {
   const valid = await makeFixturePdf([100, 100], 'valid.pdf');
   const bytes = new Uint8Array(await valid.arrayBuffer());
@@ -195,6 +212,7 @@ const TESTS: Array<{ name: string; run: () => Promise<void> }> = [
   { name: 'compress: low tier → smaller than original', run: () => testCompressTier('low') },
   { name: 'compress: recommended tier → smaller than original', run: () => testCompressTier('recommended') },
   { name: 'compress: strong tier → smaller than original', run: () => testCompressTier('strong') },
+  { name: 'compress: strong < recommended < light', run: testTierOrdering },
   { name: 'corrupt bytes: rejects with PdfError code "corrupt"', run: testCorruptRejects },
 ];
 

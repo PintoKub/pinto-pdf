@@ -185,3 +185,47 @@ other's directories. Neither adds a dependency not listed in §2.
 | 2 | Integration, all four tools on real files | me |
 | 3 | Deploy to Vercel, add Analytics | me |
 | 4 | *(post-launch, data-driven)* mupdf-wasm for lossless compress | TBD |
+
+---
+
+## 8. Deploy to Vercel
+
+Nothing to configure. No env vars, no functions, no database, no build overrides —
+all seven routes are static and every byte of work happens in the visitor's browser.
+Free tier covers it, and cost does not scale with usage.
+
+Verified before writing this: `npm run build && next start` serves the production
+bundle and `/selftest` passes 8/8 against it, so the Web Worker and the pdf.js worker
+asset both survive the production build. That was the only real deploy risk.
+
+### Steps
+
+1. **Push to GitHub.** The repo is local-only right now.
+   ```
+   gh repo create pinto-pdf --private --source=. --push
+   ```
+
+2. **Import on Vercel.** vercel.com → Add New → Project → pick the repo.
+   Framework auto-detects as Next.js. Accept every default. Do not add env vars.
+
+3. **Smoke-test the preview URL** before promoting: open `/selftest` on the deployed
+   domain and confirm 8/8. It runs the real engine, so it is a genuine end-to-end
+   check of the deployed bundle, not a static page. Then put a real scanned PDF
+   through `/compress` and a phone photo through `/photo-to-pdf` — EXIF rotation and
+   compression legibility are the two things fixtures cannot prove.
+
+4. **Promote to production.** Every push to `main` auto-deploys from then on.
+
+5. **Custom domain** — Vercel dashboard → Domains. Do this whenever, `*.vercel.app`
+   is fine to launch on.
+
+### Left deliberately undone
+
+- **`/selftest` ships publicly.** It is harmless, it is the fastest smoke test on a
+  deployed URL, and hiding it costs more than it saves. Delete the route if it ever
+  bothers you.
+- **No analytics yet.** `@vercel/analytics` is a new dependency for a question nobody
+  is asking yet. Add it once the site has visitors and you want to know which of the
+  four tools they use — that answer decides whether v2 compression is worth building.
+- **No error tracking.** Sentry is a real dependency and a real cost for a site with
+  no users. Revisit after launch.

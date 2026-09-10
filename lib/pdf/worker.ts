@@ -331,9 +331,16 @@ async function organize(file: File, pages: PageRef[], report: Progress): Promise
 // against a real "messy" PDF at Gate 1. Treat these three numbers as a
 // starting guess, not a final answer.
 const COMPRESS_TIERS: Record<CompressTier, { scale: number; quality: number }> = {
-  low: { scale: 1.0, quality: 0.75 },
-  recommended: { scale: 1.5, quality: 0.6 },
-  strong: { scale: 1.0, quality: 0.4 },
+  // `scale` multiplies the PDF's native 72 DPI, so scale 1.0 rasterizes a page
+  // at 72 DPI — far too coarse to read body text, which is what the first pass
+  // shipped. 2.0 = 144 DPI is comfortably readable; 1.4 = ~101 DPI is the floor
+  // where 10pt text still holds together. Quality carries the rest of the
+  // saving, because JPEG artifacts cost less legibility than missing pixels do.
+  // ponytail: tuned by eye against real scans, not measured. If someone
+  // complains a specific tier is still too soft, move scale before quality.
+  low: { scale: 2.0, quality: 0.82 },
+  recommended: { scale: 1.7, quality: 0.72 },
+  strong: { scale: 1.4, quality: 0.6 },
 };
 
 async function compress(file: File, tier: CompressTier, report: Progress): Promise<PdfResult> {
