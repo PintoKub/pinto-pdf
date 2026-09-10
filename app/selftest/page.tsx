@@ -9,7 +9,7 @@
 
 import { useEffect, useState } from 'react';
 import { degrees, PDFDocument, StandardFonts } from 'pdf-lib';
-import { compress, imagesToPdf, merge, organize, PdfError, type CompressTier, type PageRef } from '@/lib/pdf';
+import { compress, hasTextLayer, imagesToPdf, merge, organize, PdfError, type CompressTier, type PageRef } from '@/lib/pdf';
 
 type TestResult = { name: string; status: 'pass' | 'fail'; detail?: string };
 
@@ -184,6 +184,51 @@ async function makeNearTargetScanPdf(): Promise<File> {
   return pdfFile(doc, 'near-target-scan.pdf');
 }
 
+
+/**
+ * Text AND a big photo on the same page — a report, a CV, a form with a scanned
+ * signature. The weight is all in the JPEG; the text costs almost nothing. This
+ * is the document rasterizing handles worst: it does shrink the file, but it
+ * destroys the text layer to do it.
+ */
+async function makeMixedPdf(): Promise<File> {
+  const imgW = 1400;
+  const imgH = 1000;
+  const canvas = document.createElement('canvas');
+  canvas.width = imgW;
+  canvas.height = imgH;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('2D context unavailable');
+  const grad = ctx.createLinearGradient(0, 0, imgW, imgH);
+  grad.addColorStop(0, '#3a6ea5');
+  grad.addColorStop(1, '#c05e3c');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, imgW, imgH);
+  for (let i = 0; i < 900; i++) {
+    ctx.fillStyle = `hsl(${(i * 31) % 360} 60% ${30 + (i % 40)}%)`;
+    ctx.beginPath();
+    ctx.arc((i * 97) % imgW, (i * 61) % imgH, 4 + (i % 13), 0, Math.PI * 2);
+    ctx.fill();
+  }
+  const blob = await canvasToBlob(canvas, 'image/jpeg');
+  const jpegBytes = new Uint8Array(await blob.arrayBuffer());
+
+  const doc = await PDFDocument.create();
+  const font = await doc.embedFont(StandardFonts.Helvetica);
+  const image = await doc.embedJpg(jpegBytes);
+  const page = doc.addPage([612, 792]);
+  page.drawImage(image, { x: 54, y: 300, width: 504, height: 360 });
+  for (let i = 0; i < 14; i++) {
+    page.drawText('Quarterly summary line with real selectable text, item ' + i, {
+      x: 54,
+      y: 260 - i * 16,
+      size: 10,
+      font,
+    });
+  }
+  return pdfFile(doc, 'mixed.pdf');
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -274,6 +319,20 @@ async function testTierOrdering(): Promise<void> {
   );
 }
 
+// The whole point of v2: a document with text must come out smaller WITHOUT
+// losing its text layer. Before image-only recompression this was impossible —
+// every route to a smaller file went through rasterizing the page.
+async function testMixedKeepsText(): Promise<void> {
+  const file = await makeMixedPdf();
+  const result = await compress(file, 'recommended');
+  assertTrue(
+    result.bytes.byteLength < file.size,
+    `expected a smaller file (${result.bytes.byteLength}B vs ${file.size}B)`,
+  );
+  const out = new File([result.bytes as Uint8Array<ArrayBuffer>], 'out.pdf', { type: 'application/pdf' });
+  assertTrue(await hasTextLayer(out), 'expected the text layer to survive compression');
+}
+
 async function testCorruptRejects(): Promise<void> {
   const valid = await makeFixturePdf([100, 100], 'valid.pdf');
   const bytes = new Uint8Array(await valid.arrayBuffer());
@@ -301,6 +360,7 @@ const TESTS: Array<{ name: string; run: () => Promise<void> }> = [
   { name: 'compress: recommended tier → smaller than original', run: () => testCompressTier('recommended') },
   { name: 'compress: strong tier → smaller than original', run: () => testCompressTier('strong') },
   { name: 'compress: strong < recommended < light', run: testTierOrdering },
+  { name: 'mixed doc: shrinks AND keeps its text layer', run: testMixedKeepsText },
   { name: 'corrupt bytes: rejects with PdfError code "corrupt"', run: testCorruptRejects },
 ];
 
@@ -319,6 +379,7 @@ const CAL_FIXTURES: Array<{ name: string; make: () => Promise<File> }> = [
   { name: 'text-heavy (4pp vector text)', make: makeTextHeavyPdf },
   { name: 'scan-like (1 big JPEG page)', make: makeScanLikePdf },
   { name: 'near-target scan (144 DPI, ladder case)', make: makeNearTargetScanPdf },
+  { name: 'mixed (text + big photo)', make: makeMixedPdf },
   { name: 'raster-heavy (oversampled PNG)', make: makeRasterHeavyPdf },
 ];
 
@@ -371,8 +432,10 @@ export default function SelftestPage() {
   }
 
   useEffect(() => {
-    void runAll();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // Deferred by a tick so the first setState lands outside the effect body —
+    // React 19 flags a synchronous one as a cascading render.
+    const timer = setTimeout(() => void runAll(), 0);
+    return () => clearTimeout(timer);
   }, []);
 
   const passCount = results?.filter((r) => r.status === 'pass').length ?? 0;

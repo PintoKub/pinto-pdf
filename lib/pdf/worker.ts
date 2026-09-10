@@ -33,7 +33,12 @@ import {
   degrees,
   EncryptedPDFError,
   PageSizes,
+  PDFDict,
   PDFDocument as PdfLibDocument,
+  PDFName,
+  PDFNumber,
+  PDFRawStream,
+  PDFRef,
   type PDFImage,
 } from 'pdf-lib';
 import {
@@ -361,6 +366,137 @@ const COMPRESS_TIERS: Record<CompressTier, Array<{ scale: number; quality: numbe
   ],
 };
 
+// ---------------------------------------------------------------------------
+// Image-only recompression — the path that keeps text intact
+// ---------------------------------------------------------------------------
+// Rasterizing a whole page is a sledgehammer: it shrinks photo-heavy files but
+// destroys the text layer. For a document that mixes text with photos — a report,
+// a CV, a scanned form with a typed cover page — the bytes are almost entirely in
+// the embedded images, and the text costs nothing. So re-encode just the images
+// and leave every other object untouched.
+//
+// Scope: /DCTDecode image XObjects, i.e. streams whose bytes are already a plain
+// JPEG. That is where the weight sits in practice (cameras, scanners and Word all
+// emit DCTDecode), and it's the one filter we can hand straight to
+// createImageBitmap without implementing a PDF filter chain.
+// ponytail: Flate-encoded images are left alone. They're usually screenshots and
+// line art, where the saving is small and the risk (predictors, CMYK, indexed
+// palettes) is high. Upgrade path is decoding those too, if a real file needs it.
+
+/** Per-tier image handling: downscale factor, then JPEG quality. */
+const IMAGE_TIERS: Record<CompressTier, { imageScale: number; quality: number }> = {
+  low: { imageScale: 1.0, quality: 0.8 },
+  recommended: { imageScale: 0.8, quality: 0.7 },
+  strong: { imageScale: 0.6, quality: 0.55 },
+};
+
+/**
+ * Refs used as a soft mask or stencil mask. These are alpha channels, not
+ * pictures: they're single-channel and a viewer reads them as DeviceGray, so
+ * replacing one with a 3-channel RGB JPEG would corrupt the transparency of
+ * whatever image it belongs to.
+ */
+function collectMaskRefs(doc: PdfLibDocument): Set<string> {
+  const masks = new Set<string>();
+  for (const [, obj] of doc.context.enumerateIndirectObjects()) {
+    const dict = obj instanceof PDFRawStream ? obj.dict : obj instanceof PDFDict ? obj : null;
+    if (!dict) continue;
+    for (const key of ['SMask', 'Mask']) {
+      const entry = dict.get(PDFName.of(key));
+      if (entry instanceof PDFRef) masks.add(entry.toString());
+    }
+  }
+  return masks;
+}
+
+function isRecompressibleJpeg(stream: PDFRawStream): boolean {
+  const dict = stream.dict;
+  if (dict.lookup(PDFName.of('Subtype')) !== PDFName.of('Image')) return false;
+  // A single /DCTDecode only. An array means a filter chain we would have to
+  // unwind (e.g. Flate then DCT), which is not worth the blast radius.
+  if (dict.lookup(PDFName.of('Filter')) !== PDFName.of('DCTDecode')) return false;
+  // Stencil masks are 1-bit, and never a photo.
+  if (dict.lookup(PDFName.of('ImageMask'))) return false;
+  return true;
+}
+
+/**
+ * Re-encodes every DCTDecode image in the document. Returns null when nothing
+ * could be improved, so the caller can fall through to another strategy rather
+ * than treating "no change" as success.
+ */
+async function recompressImages(
+  originalBytes: Uint8Array,
+  tier: CompressTier,
+  filename: string,
+  report: Progress,
+): Promise<Uint8Array | null> {
+  const doc = await loadPdfLibDoc(originalBytes, filename);
+  const { imageScale, quality } = IMAGE_TIERS[tier];
+  const maskRefs = collectMaskRefs(doc);
+
+  const targets: Array<[PDFRef, PDFRawStream]> = [];
+  for (const [ref, obj] of doc.context.enumerateIndirectObjects()) {
+    if (obj instanceof PDFRawStream && !maskRefs.has(ref.toString()) && isRecompressibleJpeg(obj)) {
+      targets.push([ref, obj]);
+    }
+  }
+  if (targets.length === 0) return null;
+
+  const total = targets.length;
+  report(0, total);
+  let replaced = 0;
+
+  for (let i = 0; i < total; i++) {
+    const [ref, stream] = targets[i];
+    try {
+      const source = stream.contents;
+      const bitmap = await createImageBitmap(
+        new Blob([new Uint8Array(source)], { type: 'image/jpeg' }),
+      );
+      const width = Math.max(1, Math.round(bitmap.width * imageScale));
+      const height = Math.max(1, Math.round(bitmap.height * imageScale));
+      assertRasterSizeOk(width, height, filename);
+
+      const canvas = new OffscreenCanvas(width, height);
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        bitmap.close();
+        continue;
+      }
+      ctx.drawImage(bitmap, 0, 0, width, height);
+      bitmap.close();
+
+      const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality });
+      const encoded = new Uint8Array(await blob.arrayBuffer());
+      // Re-encoding can lose: a small, already-optimised JPEG often grows.
+      // Keep whichever is smaller, per image.
+      if (encoded.byteLength >= source.byteLength) continue;
+
+      const dict = stream.dict;
+      dict.set(PDFName.of('Width'), PDFNumber.of(width));
+      dict.set(PDFName.of('Height'), PDFNumber.of(height));
+      // canvas JPEG output is always 3-channel YCbCr, which a PDF viewer reads
+      // as DeviceRGB — so the ColorSpace must be rewritten even when the source
+      // was Gray or CMYK, and any /Decode array for the old space dropped.
+      dict.set(PDFName.of('ColorSpace'), PDFName.of('DeviceRGB'));
+      dict.set(PDFName.of('BitsPerComponent'), PDFNumber.of(8));
+      dict.delete(PDFName.of('Decode'));
+      dict.delete(PDFName.of('DecodeParms'));
+      doc.context.assign(ref, PDFRawStream.of(dict, encoded));
+      replaced++;
+    } catch {
+      // A single undecodable image must not fail the whole document; leaving it
+      // untouched is always safe.
+    }
+    report(i + 1, total);
+  }
+
+  if (replaced === 0) return null;
+  const out = new Uint8Array(await doc.save({ useObjectStreams: true }));
+  return out.byteLength < originalBytes.byteLength ? out : null;
+}
+
 async function renderPass(
   doc: PDFDocumentProxy,
   scale: number,
@@ -407,6 +543,26 @@ async function renderPass(
 async function compress(file: File, tier: CompressTier, report: Progress): Promise<PdfResult> {
   const originalBytes = await readBytes(file);
   assertNotEmpty(originalBytes, file.name);
+
+  // Two strategies, and which one is allowed depends on the document.
+  //
+  // Rasterizing every page compresses hardest, but it turns the whole document
+  // into pictures — selectable, searchable text is gone for good. That is an
+  // acceptable trade for a scan (which has no text layer to lose) and a bad one
+  // for anything typed. So: if the document has real text, only the images get
+  // touched. No warning needed, because nothing is destroyed.
+  const documentHasText = await hasTextLayer(file);
+  if (documentHasText) {
+    const recompressed = await recompressImages(originalBytes, tier, file.name, report);
+    if (recompressed) {
+      return { bytes: recompressed, filename: withSuffix(file.name, 'compressed') };
+    }
+    // No JPEGs to shrink, or shrinking them didn't help. A text-only PDF is
+    // already about as small as this format gets — rasterizing it would multiply
+    // its size by a hundred or more, so stop here rather than "trying harder".
+    return { bytes: originalBytes, filename: file.name };
+  }
+
   const { doc, loadingTask } = await loadPdfJsDoc(originalBytes, file.name);
   try {
     const ladder = COMPRESS_TIERS[tier];
@@ -426,12 +582,9 @@ async function compress(file: File, tier: CompressTier, report: Progress): Promi
       );
       // Each ladder step lands at roughly 0.6x the previous one, so from more
       // than 4x the original no remaining step can get under it — walking the
-      // rest just burns a full re-render per step. A text PDF measures ~340x
-      // here, so this is the difference between one wasted render and three on
-      // the most common "this can't be compressed" file.
+      // rest just burns a full re-render per step.
       // ponytail: 4x is a measured heuristic, not a proof. If a real file ever
-      // gets wrongly refused, raise it or compute the bound from the actual
-      // step ratios.
+      // gets wrongly refused, raise it or compute the bound from the step ratios.
       if (bytes.byteLength > originalBytes.byteLength * 4) {
         console.debug(
           `[pdf/compress] "${file.name}": ${(bytes.byteLength / originalBytes.byteLength).toFixed(1)}x the original — no lower step can win; abandoning the ladder.`,
@@ -439,11 +592,6 @@ async function compress(file: File, tier: CompressTier, report: Progress): Promi
         break;
       }
     }
-    // Every step in the ladder came out bigger than the input. That's the
-    // correct outcome for a document that is already efficient — a text PDF
-    // stores glyph references, and no raster of a page beats that. Hand back
-    // the original untouched; the caller compares sizes and tells the user the
-    // file can't be reduced, rather than offering a pointless download.
     return { bytes: originalBytes, filename: file.name };
   } finally {
     await loadingTask.destroy();

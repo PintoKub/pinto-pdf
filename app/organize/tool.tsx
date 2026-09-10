@@ -25,9 +25,11 @@ function PageGrid({
   useEffect(() => {
     let current = true;
     let urls: string[] = [];
-    setStatus("loading");
-    setPast([]);
     void (async () => {
+      // Inside the async body, not the effect body: React 19 flags a synchronous
+      // setState in an effect as a cascading render.
+      setStatus("loading");
+      setPast([]);
       try {
         urls = await renderThumbnails(file);
         if (!current) return;

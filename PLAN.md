@@ -57,22 +57,45 @@ If any agent proposes one of these, it's a review reject.
 
 ---
 
-## 3. The known-hard part: Reduce size
+## 3. Reduce size — how it actually works
 
-pdf-lib **cannot** re-compress an existing PDF's streams. Be honest about this up front.
+Two strategies. Which one runs is decided by the document, not by the user.
 
-- **v1 approach:** pdf.js renders each page to a canvas → export JPEG at a quality tier →
-  pdf-lib rebuilds the PDF from those JPEGs. Real, large size reduction. Works today.
-- **The ceiling:** output is raster. Text stops being selectable and searchable. For a
-  scanned document this is invisible; for a text PDF it's a real downgrade.
-- **v1 mitigation:** detect whether the PDF has an extractable text layer (pdf.js
-  `getTextContent()`). If it does, warn the user before compressing.
-- **Upgrade path when it matters:** `mupdf-wasm` does true stream recompression and keeps
-  text. ~10MB wasm payload, lazy-loaded only on the Compress page. Do this in v2, once
-  analytics show Compress is actually used.
+**Documents with a text layer → images only.** Every `/DCTDecode` image XObject is
+decoded, downscaled, re-encoded as JPEG and written back; every other object is left
+exactly as it was. Text stays selectable and searchable. Implemented with pdf-lib's
+object graph (`enumerateIndirectObjects`, `PDFRawStream`) — no extra dependency.
+Soft/stencil masks are skipped: they are single-channel alpha, and replacing one with
+an RGB JPEG would corrupt the transparency it belongs to.
 
-Three quality tiers: Low (1.0x scale, q0.75) / Recommended (1.5x, q0.6) / Strong (1.0x, q0.4).
-Numbers to be tuned against real files, not guessed.
+**Scans with no text layer → rasterize the page.** Nothing can be lost that isn't
+already a picture, so this compresses hardest. Each tier is a *ladder* of
+(scale, quality) steps: if a step fails to shrink the file, drop to the next. A single
+fixed scale silently did nothing on scans already near the target DPI. Above 4x the
+original the ladder is abandoned — no lower step can recover from there.
+
+`scale` multiplies the PDF's native 72 DPI, so scale 1.0 is 72 DPI and far too coarse
+to read. The light tier starts at 2.0 (144 DPI); the last step of each ladder is that
+tier's legibility floor.
+
+**Measured, on `/selftest`'s calibration table:**
+
+| document | light | recommended | strong |
+|---|---|---|---|
+| text-only | no change | no change | no change |
+| scan | -33% | -50% | -65% |
+| scan already at 144 DPI | -21% | -49% | -68% |
+| text + photo | -43% | -66% | -80% |
+| oversampled raster | -96% | -98% | -99% |
+
+A text-only PDF genuinely cannot be reduced this way — rasterizing one measures ~340x
+its original size. The UI says so plainly instead of offering a pointless download.
+
+**mupdf-wasm is not needed.** It was the planned v2 for keeping text while compressing,
+but pdf-lib's object graph does that already at zero dependency cost and no 10MB wasm
+payload. Revisit only for Flate-encoded images, which are currently left alone —
+usually screenshots and line art, where the saving is small and the decoding risk
+(predictors, CMYK, indexed palettes) is high.
 
 ---
 
