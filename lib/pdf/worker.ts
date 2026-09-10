@@ -26,6 +26,7 @@ import {
   GlobalWorkerOptions,
   InvalidPDFException,
   PasswordException,
+  type PDFDocumentLoadingTask,
   type PDFDocumentProxy,
 } from 'pdfjs-dist';
 import {
@@ -138,7 +139,93 @@ async function loadPdfLibDoc(bytes: Uint8Array, filename: string): Promise<PdfLi
   return doc;
 }
 
-async function loadPdfJsDoc(bytes: Uint8Array, filename: string): Promise<PDFDocumentProxy> {
+// pdf.js's default `CanvasFactory` (`DOMCanvasFactory` in pdf.mjs) creates
+// its scratch canvases with `document.createElement('canvas')` — used not
+// for the page we render ourselves (we pass our own `canvas` to
+// `page.render()`), but internally, for transparency-group compositing, soft
+// masks, tiling patterns and shadings (see every `owner.canvasFactory.create`
+// call site in pdf.mjs's CanvasGraphics). `document` doesn't exist in a
+// Worker, so any page using one of those crashes with "Cannot read
+// properties of undefined (reading 'createElement')" the moment
+// `canvasFactory.create()` runs — confirmed against a generated PDF whose
+// image has an alpha channel (a soft mask), which is exactly this path.
+// pdf.js already anticipates a document-free environment (`isNodeJS` picks
+// `NodeCanvasFactory`/`NodeFilterFactory` instead) — it just doesn't have a
+// third case for "real browser, but no `document`" (a Worker). Supplying our
+// own `CanvasFactory`/`FilterFactory` — the same extension point pdf.js
+// itself uses for the Node case — is that missing third case, not a hack.
+class OffscreenCanvasFactory {
+  create(width: number, height: number): { canvas: OffscreenCanvas; context: OffscreenCanvasRenderingContext2D | null } {
+    if (width <= 0 || height <= 0) throw new Error('Invalid canvas size');
+    const canvas = new OffscreenCanvas(width, height);
+    return { canvas, context: canvas.getContext('2d') };
+  }
+  reset(canvasAndContext: { canvas: OffscreenCanvas | null }, width: number, height: number): void {
+    if (!canvasAndContext.canvas) throw new Error('Canvas is not specified');
+    if (width <= 0 || height <= 0) throw new Error('Invalid canvas size');
+    canvasAndContext.canvas.width = width;
+    canvasAndContext.canvas.height = height;
+  }
+  destroy(canvasAndContext: { canvas: OffscreenCanvas | null }): void {
+    if (!canvasAndContext.canvas) throw new Error('Canvas is not specified');
+    canvasAndContext.canvas.width = 0;
+    canvasAndContext.canvas.height = 0;
+    canvasAndContext.canvas = null;
+  }
+}
+
+// ponytail: pdf.js's default `FilterFactory` needs a real DOM too (it builds
+// SVG <filter> elements for blend modes and high-contrast-mode color
+// matrices — see `DOMFilterFactory` in pdf.mjs). A Worker has no SVG DOM to
+// build them in. Rather than reimplement SVG filter compositing on top of
+// OffscreenCanvas, mirror pdf.js's own `NodeFilterFactory`: every method is a
+// no-op returning 'none'. Ceiling: pages that rely on PDF blend modes or
+// custom highlight colors render without that effect instead of crashing —
+// acceptable for a feature (compress, thumbnails) that already rasterizes
+// and doesn't promise pixel-perfect fidelity. Upgrade path, if a real PDF
+// ever needs it: an OffscreenCanvas-based filter factory using
+// `ctx.filter`/manual pixel ops instead of SVG.
+class NoopFilterFactory {
+  addFilter(): string {
+    return 'none';
+  }
+  addHCMFilter(): string {
+    return 'none';
+  }
+  addAlphaFilter(): string {
+    return 'none';
+  }
+  addLuminosityFilter(): string {
+    return 'none';
+  }
+  addKnockoutFilter(): string {
+    return 'none';
+  }
+  addHighlightHCMFilter(): string {
+    return 'none';
+  }
+  addSelectionHCMFilter(): string {
+    return 'none';
+  }
+  addSelectionFilter(): string {
+    return 'none';
+  }
+  createSelectionStyle(): null {
+    return null;
+  }
+  destroy(): void {}
+}
+
+// `destroy()` lives on the LOADING TASK returned by `getDocument(...)`, not on
+// the `PDFDocumentProxy` it resolves to (which only has `cleanup()` — see
+// node_modules/pdfjs-dist/types/src/display/api.d.ts:860 vs :1201). Callers
+// need to tear the whole thing down (worker + network requests), so we hand
+// back the loading task alongside the proxy and every caller destroys the
+// task in its `finally`, not the doc.
+async function loadPdfJsDoc(
+  bytes: Uint8Array,
+  filename: string,
+): Promise<{ doc: PDFDocumentProxy; loadingTask: PDFDocumentLoadingTask }> {
   assertNotEmpty(bytes, filename);
   // Deliberately not setting `loadingTask.onPassword`: pdf.js only prompts
   // for a password (hanging indefinitely waiting on the callback) when a
@@ -146,7 +233,17 @@ async function loadPdfJsDoc(bytes: Uint8Array, filename: string): Promise<PDFDoc
   // with a PasswordException instead — see WorkerTransport's "PasswordRequest"
   // handler in pdf.mjs. That immediate rejection is exactly what we want for
   // the 'encrypted' error code: no password UI in v1, no hang either.
-  const loadingTask = getDocument({ data: bytes });
+  const loadingTask = getDocument({
+    // pdf.js takes ownership of `data` and DETACHES its backing buffer. Hand it
+    // a copy so the caller's bytes stay usable — compress's "rasterizing made it
+    // worse, return the original untouched" path reads them again afterwards,
+    // and posting a detached buffer back to the main thread throws.
+    // ponytail: one array copy per document. Only worth avoiding if profiling
+    // says so, and the alternative is re-reading the File from disk.
+    data: new Uint8Array(bytes),
+    CanvasFactory: OffscreenCanvasFactory,
+    FilterFactory: NoopFilterFactory,
+  });
   let doc: PDFDocumentProxy;
   try {
     doc = await loadingTask.promise;
@@ -154,10 +251,10 @@ async function loadPdfJsDoc(bytes: Uint8Array, filename: string): Promise<PDFDoc
     throw classifyPdfJsError(err, filename);
   }
   if (doc.numPages === 0) {
-    await doc.destroy();
+    await loadingTask.destroy();
     throw new PdfError('empty', `"${filename}" has no pages.`, filename);
   }
-  return doc;
+  return { doc, loadingTask };
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +340,7 @@ async function compress(file: File, tier: CompressTier, report: Progress): Promi
   const originalBytes = await readBytes(file);
   assertNotEmpty(originalBytes, file.name);
   const { scale, quality } = COMPRESS_TIERS[tier];
-  const doc = await loadPdfJsDoc(originalBytes, file.name);
+  const { doc, loadingTask } = await loadPdfJsDoc(originalBytes, file.name);
   try {
     const outDoc = await PdfLibDocument.create();
     const total = doc.numPages;
@@ -295,7 +392,7 @@ async function compress(file: File, tier: CompressTier, report: Progress): Promi
     }
     return { bytes: compressedBytes, filename: withSuffix(file.name, 'compressed') };
   } finally {
-    await doc.destroy();
+    await loadingTask.destroy();
   }
 }
 
@@ -371,7 +468,13 @@ async function imagesToPdf(images: File[], opts: ImagesToPdfOptions, report: Pro
     // small quality cost (embedded at q0.92) paid on every image, not just
     // rotated ones. Upgrade path if that ever matters: parse the EXIF
     // orientation tag ourselves and skip the canvas round-trip when it's 1.
-    const sourceBlob = new Blob([bytes], { type: mimeFor(kind) });
+    // `bytes` types as Uint8Array<ArrayBufferLike> (TS 5.7+ made typed arrays
+    // generic over their backing buffer, and SharedArrayBuffer — a valid
+    // ArrayBufferLike — doesn't satisfy BlobPart). `readBytes` never actually
+    // hands back a SharedArrayBuffer-backed view, but rather than assert past
+    // the mismatch, copy through the `ArrayLike<number>` constructor overload,
+    // which is typed to always return a real `Uint8Array<ArrayBuffer>`.
+    const sourceBlob = new Blob([new Uint8Array(bytes)], { type: mimeFor(kind) });
     let bitmap: ImageBitmap;
     try {
       bitmap = await createImageBitmap(sourceBlob, { imageOrientation: 'from-image' });
@@ -437,7 +540,7 @@ const THUMBNAIL_WIDTH = 200;
 
 async function renderThumbnails(file: File, report: Progress): Promise<Blob[]> {
   const bytes = await readBytes(file);
-  const doc = await loadPdfJsDoc(bytes, file.name);
+  const { doc, loadingTask } = await loadPdfJsDoc(bytes, file.name);
   try {
     const total = doc.numPages;
     report(0, total);
@@ -465,7 +568,7 @@ async function renderThumbnails(file: File, report: Progress): Promise<Blob[]> {
     }
     return blobs;
   } finally {
-    await doc.destroy();
+    await loadingTask.destroy();
   }
 }
 
@@ -478,7 +581,7 @@ const MEANINGFUL_TEXT_CHARS = 20;
 
 async function hasTextLayer(file: File): Promise<boolean> {
   const bytes = await readBytes(file);
-  const doc = await loadPdfJsDoc(bytes, file.name);
+  const { doc, loadingTask } = await loadPdfJsDoc(bytes, file.name);
   try {
     const pagesToSample = Math.min(TEXT_SAMPLE_PAGES, doc.numPages);
     let meaningfulChars = 0;
@@ -496,7 +599,7 @@ async function hasTextLayer(file: File): Promise<boolean> {
     }
     return meaningfulChars >= MEANINGFUL_TEXT_CHARS;
   } finally {
-    await doc.destroy();
+    await loadingTask.destroy();
   }
 }
 
@@ -519,6 +622,15 @@ function toPdfError(err: unknown): PdfError {
   return new PdfError('corrupt', message || 'Unknown error.');
 }
 
+// tsconfig's `lib` is `["dom", "dom.iterable", "esnext"]` with no `webworker`
+// entry (adding it would conflict with `dom` across the rest of the app — the
+// reviewer's call, not ours to change), so TypeScript sees `self` in this
+// file as `Window`, whose `postMessage(message, targetOrigin, transfer?)`
+// doesn't match a dedicated worker's real `postMessage(message, transfer?)`.
+// This is genuinely a `DedicatedWorkerGlobalScope` at runtime; alias it to
+// the one shape we actually call instead of fighting `Window`'s overloads.
+const workerSelf = self as unknown as { postMessage(message: unknown, transfer?: Transferable[]): void };
+
 self.onmessage = async (event: MessageEvent<unknown>) => {
   const data = event.data;
   // Anything not shaped like our own protocol is ignored rather than
@@ -527,7 +639,7 @@ self.onmessage = async (event: MessageEvent<unknown>) => {
   if (!isWorkerRequest(data)) return;
   const { id } = data;
   const report: Progress = (done, total) => {
-    self.postMessage({ id, kind: 'progress', done, total } satisfies WorkerResponse);
+    workerSelf.postMessage({ id, kind: 'progress', done, total } satisfies WorkerResponse);
   };
 
   try {
@@ -557,10 +669,10 @@ self.onmessage = async (event: MessageEvent<unknown>) => {
     }
     const response: WorkerResponse = { id, kind: 'result', value };
     const transfer: Transferable[] = value.op === 'pdf' ? [value.result.bytes.buffer as ArrayBuffer] : [];
-    self.postMessage(response, transfer);
+    workerSelf.postMessage(response, transfer);
   } catch (err) {
     const pdfErr = toPdfError(err);
-    self.postMessage({
+    workerSelf.postMessage({
       id,
       kind: 'error',
       code: pdfErr.code,

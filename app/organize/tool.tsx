@@ -79,13 +79,18 @@ function PageGrid({
   }
 
   if (status === "loading") {
-    return <p className="text-soft text-[15px]">Reading pages…</p>;
+    return (
+      <p role="status" aria-live="polite" className="text-soft text-[15px]">
+        Reading pages…
+      </p>
+    );
   }
 
   if (status === "error") {
     return (
       <p
         role="alert"
+        aria-live="assertive"
         className="text-danger border-danger/30 rounded-[14px] border px-4 py-3 text-[15px] leading-6"
       >
         {message}

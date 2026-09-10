@@ -65,6 +65,9 @@ export default function ToolShell({
   const [dragging, setDragging] = useState(false);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
+  // ponytail: announced in coarse 10% steps, not on every tick, so a screen
+  // reader gets occasional progress instead of a flood of near-identical reads.
+  const [announced, setAnnounced] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<{ url: string; filename: string } | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -108,17 +111,25 @@ export default function ToolShell({
     setError(null);
     setResult(null);
     setProgress(0);
+    setAnnounced("Working…");
     try {
-      const output = await run(files, (done, total) =>
-        setProgress(total > 0 ? done / total : 0),
-      );
+      const output = await run(files, (done, total) => {
+        const value = total > 0 ? done / total : 0;
+        setProgress(value);
+        setAnnounced((current) => {
+          const step = `Working — ${Math.round(value * 10) * 10}% complete.`;
+          return step !== current ? step : current;
+        });
+      });
       // The engine never hands back a SharedArrayBuffer view, so this is safe
       // and avoids copying a large PDF just to satisfy BlobPart.
       const bytes = output.bytes as Uint8Array<ArrayBuffer>;
       const url = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
       setResult({ url, filename: output.filename });
+      setAnnounced("Done. Your PDF is ready.");
     } catch (thrown) {
       setError(describe(thrown));
+      setAnnounced("");
     } finally {
       setBusy(false);
     }
@@ -258,9 +269,16 @@ export default function ToolShell({
         </div>
       )}
 
+      {/* Visually hidden: the progress bar above is visual-only, so a screen
+          reader needs its own polite announcement of the same work. */}
+      <p role="status" aria-live="polite" className="sr-only">
+        {announced}
+      </p>
+
       {error && (
         <p
           role="alert"
+          aria-live="assertive"
           className="text-danger border-danger/30 mt-8 rounded-[14px] border px-4 py-3 text-[15px] leading-6"
         >
           {error}
