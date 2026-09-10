@@ -1,69 +1,92 @@
-import Image from "next/image";
+import Link from "next/link";
+import { tools } from "@/components/tools";
+
+const facts = [
+  {
+    term: "Nothing uploads",
+    detail:
+      "Every page is read, rewritten and saved by code running in this tab. No server ever receives the file.",
+  },
+  {
+    term: "Nothing is stored",
+    detail:
+      "There is no database and no account. Close the tab and the document is gone from here entirely.",
+  },
+  {
+    term: "It keeps working offline",
+    detail:
+      "Once the page has loaded, the tools run without a connection. Airplane mode is a fine place to merge a PDF.",
+  },
+];
 
 export default function Home() {
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert h-5 w-[100px]"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the{" "}
-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-              page.tsx
-            </code>{" "}
-            file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
+    <>
+      <section className="mx-auto max-w-[980px] px-5 pt-24 pb-20 text-center sm:pt-32 sm:pb-28">
+        <h1 className="display mx-auto max-w-[15ch] text-balance">
+          Your files never leave your device.
+        </h1>
+        <p className="lede text-soft mx-auto mt-6 max-w-[52ch]">
+          Merge, compress, organize and build PDFs right here in the browser. No
+          upload, no account, no waiting on a queue.
+        </p>
+        <p className="mt-6">
+          <Link
+            href="#tools"
+            className="text-accent hover:text-accent-hover text-[17px] transition-colors"
+          >
+            Pick a tool&nbsp;&rsaquo;
+          </Link>
+        </p>
+      </section>
+
+      <section id="tools" className="mx-auto max-w-[980px] scroll-mt-16 px-5 pb-24">
+        <ul className="grid gap-4 sm:grid-cols-2">
+          {tools.map((tool) => (
+            <li key={tool.href}>
+              <Link
+                href={tool.href}
+                className="bg-surface border-hairline hover:border-accent group flex h-full flex-col rounded-[18px] border p-7 transition-colors"
+              >
+                <span className="text-accent">{tool.glyph}</span>
+                <span className="mt-5 text-[21px] font-semibold tracking-tight">
+                  {tool.name}
+                </span>
+                <span className="text-soft mt-2 text-[15px] leading-6">
+                  {tool.blurb}
+                </span>
+              </Link>
+            </li>
+          ))}
+        </ul>
+      </section>
+
+      <section className="border-hairline border-t">
+        <div className="mx-auto max-w-[980px] px-5 py-20 sm:py-24">
+          <h2 className="title max-w-[18ch] text-balance">
+            Privacy here is architecture, not a policy.
+          </h2>
+          <dl className="mt-12 max-w-[62ch]">
+            {facts.map((fact) => (
+              <div
+                key={fact.term}
+                className="border-hairline border-t py-6 sm:flex sm:gap-10"
+              >
+                <dt className="text-[17px] font-semibold sm:w-[13rem] sm:shrink-0">
+                  {fact.term}
+                </dt>
+                <dd className="text-soft mt-2 text-[15px] leading-6 sm:mt-0">
+                  {fact.detail}
+                </dd>
+              </div>
+            ))}
+          </dl>
+          <p className="text-soft mt-8 max-w-[62ch] text-[13px] leading-5">
+            The trade-off: your device does the work. Files over roughly 200 MB, or
+            an older phone, may run out of memory.
           </p>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert h-[14px] w-4"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={14}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
+      </section>
+    </>
   );
 }
